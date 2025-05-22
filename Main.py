@@ -1,6 +1,6 @@
 import tkinter as tk
 import sqlite3
-import ctldata
+
 class MainApp(tk.Tk):
     def __init__(self):
         super().__init__()
