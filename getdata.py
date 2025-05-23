@@ -2,6 +2,7 @@ import aiohttp
 import asyncio
 import aiosqlite
 from tenacity import retry, stop_after_attempt, wait_exponential
+from tqdm import tqdm
 
 # 配置常量
 DATABASE_PATH = './Datas/database.db'
@@ -45,9 +46,8 @@ class APIClient:
                 raise
 
 async def initialize_database():
-    """初始化数据库结构并检查列是否存在"""
+    """初始化数据库结构"""
     async with aiosqlite.connect(DATABASE_PATH) as db:
-        # 创建表（如果不存在）
         await db.execute('''
             CREATE TABLE IF NOT EXISTS item (
                 type_id INTEGER PRIMARY KEY,
@@ -63,29 +63,21 @@ async def initialize_database():
                 iconID INTEGER
             )
         ''')
-
-        # 检查iconID列是否存在
-        cursor = await db.execute("PRAGMA table_info(item)")
-        columns = [row[1] async for row in cursor]
-        if 'iconID' not in columns:
-            await db.execute("ALTER TABLE item ADD COLUMN iconID INTEGER")
-            print("数据库已添加缺失的iconID列")
-
         await db.commit()
 
-async def fetch_type_ids(client):
-    """获取所有有效的type_id"""
+async def fetch_valid_type_ids(client):
+    """获取所有有效的type_id并过滤无market_group_id的条目"""
     url = f"{API_BASE_URL}/universe/types"
     data = await client.fetch(url)
     return sorted(tid for tid in data if tid >= START_TYPE_ID)
 
 async def initialize_type_ids(client):
-    """初始化type_id到数据库"""
+    """初始化有效type_id到数据库"""
     async with aiosqlite.connect(DATABASE_PATH) as db:
         cursor = await db.execute("SELECT type_id FROM item")
         existing_ids = {row[0] async for row in cursor}
 
-        type_ids = await fetch_type_ids(client)
+        type_ids = await fetch_valid_type_ids(client)
         new_ids = [(tid,) for tid in type_ids if tid not in existing_ids]
 
         if new_ids:
@@ -138,13 +130,16 @@ async def process_type(client, type_id):
     if not data:
         return None
 
-    # 提取字段
-    group_id = data.get('groupID')
+    # 检查market_group_id有效性
     market_group_id = data.get('marketGroupID')
+    if not market_group_id or market_group_id <= 0:
+        return None
+
+    # 提取其他字段
+    group_id = data.get('groupID')
     volume = data.get('volume', 0.0)
     iconID = data.get('iconID', 0)
     
-    # 处理名称
     name_data = data.get('name', {})
     en_name = name_data.get('en', '') if isinstance(name_data, dict) else str(name_data)
     zh_name = name_data.get('zh', '') if isinstance(name_data, dict) else ''
@@ -159,22 +154,9 @@ async def process_type(client, type_id):
         en_name, zh_name,
         group_id, en_group, zh_group,
         market_group_id, en_market, zh_market,
-        volume, iconID or market_icon,  # 优先使用type的iconID
+        volume, iconID or market_icon,
         type_id
     )
-
-async def worker(client, queue, db_writer):
-    """工作协程"""
-    while True:
-        type_id = await queue.get()
-        try:
-            result = await process_type(client, type_id)
-            if result:
-                await db_writer.add_data(result)
-        except Exception as e:
-            print(f"处理type_id {type_id} 失败: {str(e)}")
-        finally:
-            queue.task_done()
 
 class DatabaseWriter:
     """异步批量写入器"""
@@ -211,8 +193,28 @@ class DatabaseWriter:
         '''
         await self.conn.executemany(query, self.buffer)
         await self.conn.commit()
-        print(f"已提交 {len(self.buffer)} 条数据")
         self.buffer.clear()
+
+    async def delete_data(self, type_id):
+        """删除无效条目"""
+        await self.conn.execute("DELETE FROM item WHERE type_id=?", (type_id,))
+        await self.conn.commit()
+
+async def worker(client, queue, writer, pbar):
+    """工作协程"""
+    while True:
+        type_id = await queue.get()
+        try:
+            result = await process_type(client, type_id)
+            if result:
+                await writer.add_data(result)
+            else:
+                await writer.delete_data(type_id)
+        except Exception as e:
+            print(f"处理type_id {type_id} 失败: {str(e)}")
+        finally:
+            queue.task_done()
+            pbar.update(1)
 
 async def main():
     await initialize_database()
@@ -222,31 +224,39 @@ async def main():
 
         queue = asyncio.Queue()
         
-        # 只获取需要更新的type_id（至少有一个字段为空）
+        # 获取待处理type_id
         async with aiosqlite.connect(DATABASE_PATH) as db:
             cursor = await db.execute(f'''
                 SELECT type_id FROM item 
                 WHERE type_id >= {START_TYPE_ID}
-                AND (en_name IS NULL 
-                     OR zh_name IS NULL 
-                     OR group_id IS NULL
-                     OR iconID IS NULL)
-                ORDER BY type_id
+                AND (en_name IS NULL OR market_group_id IS NULL)
             ''')
             type_ids = [row[0] async for row in cursor]
+
+        total = len(type_ids)
+        pbar = tqdm(total=total, desc='数据抓取进度', unit='item')
 
         for tid in type_ids:
             await queue.put(tid)
 
-        workers = [
-            asyncio.create_task(worker(client, queue, writer))
-            for _ in range(CONCURRENCY)
-        ]
+        # 启动工作协程
+        workers = [asyncio.create_task(worker(client, queue, writer, pbar))
+                  for _ in range(CONCURRENCY)]
 
         await queue.join()
-
+        pbar.close()
+        # 等待关闭
         for task in workers:
             task.cancel()
+        await asyncio.gather(*workers, return_exceptions=True)
+        
+        # 显式关闭连接池
+        await client.session.__aexit__(None, None, None)  # 新增
+        # 清理工作协程
+        for task in workers:
+            task.cancel()
+        await asyncio.gather(*workers, return_exceptions=True)
 
 if __name__ == "__main__":
+    asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
     asyncio.run(main())
