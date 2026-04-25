@@ -5,7 +5,7 @@ from tenacity import retry, stop_after_attempt, wait_exponential
 from tqdm import tqdm
 
 # 配置常量
-DATABASE_PATH = './Datas/items.db'
+DATABASE_PATH = './database/items.db'
 API_BASE_URL = 'https://sde.jita.space/latest'
 CONCURRENCY = 50
 BATCH_SIZE = 100
